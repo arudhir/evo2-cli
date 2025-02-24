@@ -3,6 +3,7 @@ import os
 import requests
 import base64
 import io
+import json
 import numpy as np
 import argparse
 import tempfile
@@ -10,6 +11,7 @@ from math import ceil
 from tqdm import tqdm
 from Bio import SeqIO  # Requires: pip install biopython
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import seqhash  # pip install seqhash
 
 # Define chunk size (50 kb)
 CHUNK_SIZE = 50000
@@ -55,7 +57,7 @@ def query_forward(sequence_chunk, url, key):
         raise ValueError(f"Unexpected Content-Type: {content_type}")
 
 def run_forward(args, key, url):
-    """Process the forward pass: chunk sequence if needed and combine embeddings."""
+    """Process the forward pass: chunk sequence if needed, combine embeddings, and save as npy in a hash directory."""
     input_sequence = get_sequence(args)
     seq_length = len(input_sequence)
     print(f"Input sequence length: {seq_length} bases")
@@ -84,7 +86,7 @@ def run_forward(args, key, url):
                     print(f"Error processing chunk {i+1}: {e}")
                     return
 
-        # Combine embeddings: if each chunk has shape (1, L, D), combine along axis=1.
+        # Combine embeddings. If each chunk has shape (1, L, D), combine along axis=1.
         if embeddings[0].ndim == 3:
             final_embedding = np.concatenate(embeddings, axis=1)
         else:
@@ -104,18 +106,19 @@ def run_forward(args, key, url):
     print(f"  Min:  {np.min(final_embedding):.4f}")
     print(f"  Max:  {np.max(final_embedding):.4f}")
 
-    # Determine output file name.
-    if args.output is None:
-        with tempfile.NamedTemporaryFile(suffix=".npy", delete=False) as tmp:
-            output_filename = tmp.name
-    else:
+    # Compute the hash of the input sequence.
+    seq_hash = seqhash.seqhash(input_sequence)
+    out_dir = os.path.join("outputs", "forward", seq_hash)
+    os.makedirs(out_dir, exist_ok=True)
+    output_filename = os.path.join(out_dir, "embeddings.npy")
+    if args.output:
         output_filename = args.output
 
     np.save(output_filename, final_embedding)
     print(f"Embedding saved to {output_filename}")
 
 def run_generate(args, key, url):
-    """Process a generation request and save the generated sequence as FASTA."""
+    """Process a generation request and save the generated sequence as JSON in a hash directory."""
     input_sequence = get_sequence(args)
     print(f"Input prompt sequence length: {len(input_sequence)} bases")
 
@@ -143,26 +146,26 @@ def run_generate(args, key, url):
         if not generated_seq:
             print("No sequence generated in the response.")
             return
+        data = response_json
     elif "text/plain" in content_type:
         generated_seq = response.text.strip()
+        data = {"generated_sequence": generated_seq, "prompt": input_sequence}
     else:
         print("Unexpected Content-Type:", content_type)
         return
 
     print("Generated sequence length:", len(generated_seq))
 
-    # Determine output filename.
-    if args.output is None:
-        with tempfile.NamedTemporaryFile(suffix=".fasta", delete=False) as tmp:
-            output_filename = tmp.name
-    else:
+    # Compute the hash of the generated sequence.
+    seq_hash = seqhash.seqhash(generated_seq)
+    out_dir = os.path.join("outputs", "generate", seq_hash)
+    os.makedirs(out_dir, exist_ok=True)
+    output_filename = os.path.join(out_dir, "generate.json")
+    if args.output:
         output_filename = args.output
 
-    # Save as FASTA format (wrap lines at 80 characters).
     with open(output_filename, "w") as f:
-        f.write(">generated_sequence\n")
-        for i in range(0, len(generated_seq), 80):
-            f.write(generated_seq[i:i+80] + "\n")
+        json.dump(data, f, indent=2)
     print(f"Generated sequence saved to {output_filename}")
 
 def main():
@@ -176,7 +179,7 @@ def main():
     group_forward = forward_parser.add_mutually_exclusive_group(required=True)
     group_forward.add_argument("-s", "--sequence", type=str, help="Input DNA sequence.")
     group_forward.add_argument("-f", "--fasta", type=str, help="Path to a FASTA file containing the DNA sequence.")
-    forward_parser.add_argument("-o", "--output", type=str, default=None, help="Output file for embedding (default: temporary file).")
+    forward_parser.add_argument("-o", "--output", type=str, default=None, help="Override output file location.")
 
     # Generate subcommand
     generate_parser = subparsers.add_parser("generate", help="Generate DNA sequence using Evo2.")
@@ -191,7 +194,7 @@ def main():
     generate_parser.add_argument("--enable_logits", action="store_true", help="Enable logits output.")
     generate_parser.add_argument("--enable_sampled_probs", action="store_true", help="Enable sampled probabilities.")
     generate_parser.add_argument("--enable_elapsed_ms_per_token", action="store_true", help="Enable per-token timing.")
-    generate_parser.add_argument("-o", "--output", type=str, default=None, help="Output file for generated sequence FASTA (default: temporary file).")
+    generate_parser.add_argument("-o", "--output", type=str, default=None, help="Override output file location.")
 
     args = parser.parse_args()
 
@@ -199,11 +202,9 @@ def main():
     key = os.getenv("NGC_API_KEY") or input("Paste the Run Key: ")
 
     if args.command == "forward":
-        # Forward endpoint for embeddings.
         url = os.getenv("URL", "https://health.api.nvidia.com/v1/biology/arc/evo2-40b/forward").strip('"')
         run_forward(args, key, url)
     elif args.command == "generate":
-        # Use the working generate endpoint.
         url = os.getenv("URL", "https://health.api.nvidia.com/v1/biology/arc/evo2-40b/generate").strip('"')
         run_generate(args, key, url)
 
